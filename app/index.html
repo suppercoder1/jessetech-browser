@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>JesseTech Browser</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="app-header" role="banner">
+      <section class="tabs-row">
+        <div id="tabBar" class="tab-bar" aria-label="Tabs"></div>
+        <div class="tab-actions">
+          <button id="newPrivateTabBtn" class="btn subtle-btn" title="New private tab" aria-label="New private tab">Private Tab</button>
+          <button id="newPrivateWindowBtn" class="btn subtle-btn" title="New private window" aria-label="New private window">Private Window</button>
+          <button id="newTabBtn" class="btn subtle-btn" title="New tab" aria-label="New tab">+</button>
+        </div>
+      </section>
+
+      <section class="toolbar">
+        <button id="profileChipBtn" class="btn profile-chip" title="Current profile" aria-label="Current profile">
+          Personal
+        </button>
+        <button id="backBtn" class="btn icon-btn" title="Back" aria-label="Back">Back</button>
+        <button id="forwardBtn" class="btn icon-btn" title="Forward" aria-label="Forward">Forward</button>
+        <button id="reloadBtn" class="btn icon-btn" title="Reload" aria-label="Reload">Reload</button>
+        <button id="homeBtn" class="btn icon-btn" title="Home" aria-label="Home">Home</button>
+        <span id="securityBadge" class="security-badge">...</span>
+        <div class="address-wrap">
+          <input
+            id="urlInput"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Address bar"
+            placeholder="Search SearxNG or type URL"
+          />
+          <ul id="suggestionsList" class="suggestions hidden" aria-label="Address suggestions"></ul>
+        </div>
+        <button id="findBtn" class="btn icon-btn" title="Find in page" aria-label="Find in page">Find</button>
+        <button id="historyBtn" class="btn icon-btn" title="History" aria-label="History">History</button>
+        <button id="downloadsBtn" class="btn icon-btn" title="Downloads" aria-label="Downloads">Downloads</button>
+        <button id="permissionsBtn" class="btn icon-btn" title="Permissions" aria-label="Permissions">Permissions</button>
+        <button id="bookmarksBtn" class="btn icon-btn" title="Bookmarks" aria-label="Bookmarks">Bookmarks</button>
+        <button id="settingsBtn" class="btn icon-btn" title="Settings" aria-label="Settings">Settings</button>
+      </section>
+    </header>
+
+    <aside id="findPanel" class="panel hidden" aria-label="Find in page">
+      <h2>Find In Page</h2>
+      <input id="findInput" type="text" autocomplete="off" spellcheck="false" aria-label="Find text" />
+      <div class="find-actions">
+        <button id="findPrevBtn" class="btn">Prev</button>
+        <button id="findNextBtn" class="btn">Next</button>
+        <button id="findCloseBtn" class="btn">Close</button>
+      </div>
+      <p id="findStatus" class="subtle-text"></p>
+    </aside>
+
+    <aside id="bookmarksPanel" class="panel hidden" aria-label="Bookmarks panel">
+      <h2>Bookmarks</h2>
+      <button id="addBookmarkBtn" class="btn panel-btn" title="Add current page" aria-label="Add current page">
+        Add Current Page
+      </button>
+      <ul id="bookmarksList"></ul>
+    </aside>
+
+    <aside id="historyPanel" class="panel hidden" aria-label="History panel">
+      <h2>History</h2>
+      <input id="historySearchInput" type="text" autocomplete="off" spellcheck="false" aria-label="Search history" />
+      <button id="clearHistoryBtn" class="btn panel-btn" title="Clear history" aria-label="Clear history">Clear History</button>
+      <ul id="historyList"></ul>
+    </aside>
+
+    <aside id="downloadsPanel" class="panel hidden" aria-label="Downloads panel">
+      <h2>Downloads</h2>
+      <ul id="downloadsList"></ul>
+    </aside>
+
+    <aside id="settingsPanel" class="panel hidden" aria-label="Settings panel">
+      <h2>Settings</h2>
+      <label>
+        Startup Page
+        <input id="startupPageInput" type="text" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>
+        Default Zoom
+        <input id="defaultZoomInput" type="number" min="0.25" max="3" step="0.05" />
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="restoreSessionToggle" />
+        Restore previous session
+      </label>
+      <label>
+        Profile
+        <select id="profileSelect"></select>
+      </label>
+      <div class="settings-inline">
+        <input id="newProfileInput" type="text" autocomplete="off" spellcheck="false" placeholder="new profile name" />
+        <button id="addProfileBtn" class="btn">Add</button>
+      </div>
+      <button id="saveSettingsBtn" class="btn panel-btn">Save Settings</button>
+      <div class="settings-inline backup-actions">
+        <button id="exportBackupBtn" class="btn">Export Backup</button>
+        <button id="importBackupBtn" class="btn">Import Backup</button>
+      </div>
+      <input id="importBackupInput" type="file" accept="application/json" class="hidden" />
+      <label>
+        Theme
+        <select id="themeSelect">
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="blockPopupsToggle" />
+        Block popups
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="blockThirdPartyCookiesToggle" />
+        Block third-party cookies
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="blockTrackersToggle" />
+        Block known trackers/ads
+      </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="clearDataOnExitToggle" />
+        Clear data on exit
+      </label>
+    </aside>
+
+    <aside id="permissionsPanel" class="panel hidden" aria-label="Permissions panel">
+      <h2>Site Permissions</h2>
+      <p id="permissionsOrigin" class="subtle-text">No active site</p>
+      <label>
+        Camera
+        <select id="cameraPermissionSelect">
+          <option value="ask">Ask</option>
+          <option value="allow">Allow</option>
+          <option value="block">Block</option>
+        </select>
+      </label>
+      <label>
+        Microphone
+        <select id="microphonePermissionSelect">
+          <option value="ask">Ask</option>
+          <option value="allow">Allow</option>
+          <option value="block">Block</option>
+        </select>
+      </label>
+      <label>
+        Location
+        <select id="geolocationPermissionSelect">
+          <option value="ask">Ask</option>
+          <option value="allow">Allow</option>
+          <option value="block">Block</option>
+        </select>
+      </label>
+      <label>
+        Notifications
+        <select id="notificationsPermissionSelect">
+          <option value="ask">Ask</option>
+          <option value="allow">Allow</option>
+          <option value="block">Block</option>
+        </select>
+      </label>
+    </aside>
+
+    <main id="webviewContainer" class="webview-container" aria-label="Browser content">
+      <div id="pageLoadingOverlay" class="page-loading-overlay">Loading...</div>
+    </main>
+
+    <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>
