@@ -25,19 +25,22 @@ A fast, lightweight desktop browser built with Electron, with **SearXNG** as the
 
 ### 1. Install dependencies
 
-```bash
 npm install
-2. Run in development
+
+### 2. Run in development
+
 npm start
-3. Build for macOS
+
+### 3. Build for macOS
+
 npm run dist
 Build outputs are generated in the dist/ folder.
 
 Project Structure
 app/
   index.html
-  renderer.js
   main.js
+  renderer.js
   assets/
 build/
 dist/
@@ -54,6 +57,6 @@ Cmd + Plus / Minus / 0 Zoom in / out / reset
 Notes
 Private browsing data is isolated from normal history.
 Build artifacts (dist/, build/) and dependencies (node_modules/) should not be committed to Git.
-License
-MIT (or your preferred license)
 
+License
+MIT
