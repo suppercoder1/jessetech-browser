@@ -19,6 +19,9 @@ contextBridge.exposeInMainWorld('api', {
 
   getDownloads: () => ipcRenderer.invoke('downloads:list'),
   openDownloadInFolder: (id) => ipcRenderer.invoke('downloads:open', id),
+  importPasswords: (rows) => ipcRenderer.invoke('passwords:import', rows),
+  listPasswords: () => ipcRenderer.invoke('passwords:list'),
+  getPasswordsForUrl: (url) => ipcRenderer.invoke('passwords:getForUrl', url),
 
   openPrivateWindow: () => ipcRenderer.invoke('window:new-private'),
 

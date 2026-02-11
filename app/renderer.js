@@ -60,6 +60,10 @@ const blockPopupsToggle = document.getElementById('blockPopupsToggle');
 const blockThirdPartyCookiesToggle = document.getElementById('blockThirdPartyCookiesToggle');
 const blockTrackersToggle = document.getElementById('blockTrackersToggle');
 const clearDataOnExitToggle = document.getElementById('clearDataOnExitToggle');
+const autofillPasswordsToggle = document.getElementById('autofillPasswordsToggle');
+const importPasswordsBtn = document.getElementById('importPasswordsBtn');
+const importPasswordsInput = document.getElementById('importPasswordsInput');
+const passwordsList = document.getElementById('passwordsList');
 
 const permissionsPanel = document.getElementById('permissionsPanel');
 const permissionsOrigin = document.getElementById('permissionsOrigin');
@@ -84,6 +88,7 @@ let browserConfig = {
     startupPage: 'https://searxng.jessetech.nl',
     defaultZoom: 1,
     restoreSession: true,
+    autofillPasswords: true,
     currentProfile: 'personal',
     profiles: ['personal', 'work'],
   },
@@ -97,6 +102,7 @@ let historyEntries = loadHistoryEntries();
 let zoomByOrigin = loadJson(STORAGE_KEYS.zoomByOrigin, {});
 let downloads = [];
 let closedTabs = [];
+let savedPasswords = [];
 let suggestionItems = [];
 let selectedSuggestionIndex = -1;
 let suggestionRequestId = 0;
@@ -774,6 +780,163 @@ function renderDownloads() {
     item.append(name, status, actions);
     downloadsList.appendChild(item);
   });
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    const next = text[i + 1];
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        cell += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (char === ',' && !inQuotes) {
+      row.push(cell);
+      cell = '';
+      continue;
+    }
+
+    if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && next === '\n') i += 1;
+      row.push(cell);
+      if (row.some((value) => String(value || '').trim() !== '')) {
+        rows.push(row);
+      }
+      row = [];
+      cell = '';
+      continue;
+    }
+
+    cell += char;
+  }
+
+  if (cell.length > 0 || row.length > 0) {
+    row.push(cell);
+    if (row.some((value) => String(value || '').trim() !== '')) {
+      rows.push(row);
+    }
+  }
+
+  return rows;
+}
+
+function mapCsvRowsToPasswordRecords(text) {
+  const rows = parseCsv(text);
+  if (!rows.length) return [];
+
+  const headers = rows[0].map((header) => String(header || '').trim().toLowerCase());
+  return rows.slice(1).map((values) => {
+    const item = {};
+    headers.forEach((header, index) => {
+      item[header] = String(values[index] || '').trim();
+    });
+
+    return {
+      url: item.url || item.website || item.origin || item.site || item.domain || '',
+      username: item.username || item.user || item.account || item.email || item.login || '',
+      password: item.password || item.pass || item.secret || '',
+      name: item.name || item.title || item.label || item.website || '',
+    };
+  });
+}
+
+function renderSavedPasswords() {
+  passwordsList.innerHTML = '';
+  if (!savedPasswords.length) {
+    const empty = document.createElement('li');
+    empty.className = 'empty-state';
+    empty.textContent = 'No saved passwords yet';
+    passwordsList.appendChild(empty);
+    return;
+  }
+
+  savedPasswords.slice(0, 80).forEach((entry) => {
+    const item = document.createElement('li');
+    item.className = 'password-item';
+
+    const main = document.createElement('div');
+    main.className = 'password-site';
+    main.textContent = entry.name || entry.origin;
+
+    const details = document.createElement('div');
+    details.className = 'password-user';
+    details.textContent = `${entry.username} - ${entry.origin}`;
+
+    item.append(main, details);
+    passwordsList.appendChild(item);
+  });
+}
+
+async function refreshSavedPasswords() {
+  savedPasswords = await window.api.listPasswords();
+  renderSavedPasswords();
+}
+
+async function importPasswordsFromFile(file) {
+  if (!file) return { imported: 0, inserted: 0, updated: 0, skipped: 0 };
+  const text = await file.text();
+  const rows = mapCsvRowsToPasswordRecords(text);
+  return window.api.importPasswords(rows);
+}
+
+async function tryAutofillPasswords(tab) {
+  if (!tab || tab.isPrivate || browserConfig.settings.autofillPasswords === false) return;
+
+  const url = tab.webview.getURL() || tab.url;
+  if (!/^https?:\/\//i.test(url)) return;
+
+  const credentials = await window.api.getPasswordsForUrl(url);
+  if (!Array.isArray(credentials) || credentials.length === 0) return;
+
+  const first = credentials[0];
+  try {
+    await tab.webview.executeJavaScript(
+      `
+      (() => {
+        const username = ${JSON.stringify(first.username)};
+        const password = ${JSON.stringify(first.password)};
+        const passInput = document.querySelector('input[type="password"]:not([disabled])');
+        if (!passInput) return false;
+
+        const form = passInput.form || document;
+        const userInput =
+          form.querySelector('input[type="email"]:not([disabled])') ||
+          form.querySelector('input[type="text"]:not([disabled])') ||
+          form.querySelector('input[name*="user" i]:not([disabled])') ||
+          form.querySelector('input[name*="email" i]:not([disabled])');
+
+        if (userInput && !userInput.value) {
+          userInput.value = username;
+          userInput.dispatchEvent(new Event('input', { bubbles: true }));
+          userInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        if (!passInput.value) {
+          passInput.value = password;
+          passInput.dispatchEvent(new Event('input', { bubbles: true }));
+          passInput.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        }
+        return false;
+      })();
+    `,
+      true,
+    );
+  } catch {
+    // Ignore pages that block JS injection in subframes.
+  }
 }
 
 function addBookmark() {

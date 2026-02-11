@@ -6,6 +6,7 @@ const {
   ipcMain,
   session,
   shell,
+  safeStorage,
 } = require('electron');
 const fs = require('fs');
 const path = require('path');
@@ -28,6 +29,7 @@ const defaultState = {
     clearDataOnExit: false,
     blockThirdPartyCookies: false,
     blockTrackers: false,
+    autofillPasswords: true,
     currentProfile: DEFAULT_PROFILE,
     profiles: ['personal', 'work'],
   },
@@ -38,6 +40,182 @@ let appState = structuredClone(defaultState);
 let isQuittingAfterClear = false;
 let statePath = '';
 let crashLogPath = '';
+let passwordsPath = '';
+
+function getPasswordsPath() {
+  if (!passwordsPath) {
+    passwordsPath = path.join(app.getPath('userData'), 'passwords-vault.json');
+  }
+  return passwordsPath;
+}
+
+function encryptPassword(plainText) {
+  const text = String(plainText || '');
+  if (safeStorage.isEncryptionAvailable()) {
+    try {
+      return {
+        method: 'safeStorage',
+        value: safeStorage.encryptString(text).toString('base64'),
+      };
+    } catch {
+      // Fallback below.
+    }
+  }
+  return {
+    method: 'plain',
+    value: text,
+  };
+}
+
+function decryptPassword(payload) {
+  const method = payload?.method;
+  const value = String(payload?.value || '');
+  if (!value) return '';
+  if (method === 'safeStorage') {
+    try {
+      return safeStorage.decryptString(Buffer.from(value, 'base64'));
+    } catch {
+      return '';
+    }
+  }
+  return value;
+}
+
+function readPasswordVault() {
+  const vaultPath = getPasswordsPath();
+  try {
+    const raw = fs.readFileSync(vaultPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed?.entries)) {
+      return { version: 1, entries: [] };
+    }
+    return {
+      version: 1,
+      entries: parsed.entries
+        .map((entry) => ({
+          id: String(entry.id || ''),
+          origin: String(entry.origin || ''),
+          username: String(entry.username || ''),
+          name: String(entry.name || ''),
+          password: {
+            method: entry.password?.method || 'plain',
+            value: String(entry.password?.value || ''),
+          },
+          createdAt: Number(entry.createdAt || Date.now()),
+          updatedAt: Number(entry.updatedAt || Date.now()),
+        }))
+        .filter((entry) => entry.id && entry.origin && entry.username && entry.password.value),
+    };
+  } catch {
+    return { version: 1, entries: [] };
+  }
+}
+
+function writePasswordVault(vault) {
+  const next = {
+    version: 1,
+    entries: Array.isArray(vault?.entries) ? vault.entries : [],
+  };
+  fs.writeFileSync(getPasswordsPath(), JSON.stringify(next, null, 2), 'utf8');
+}
+
+function normalizePasswordRow(row) {
+  const urlValue = String(row.url || row.website || row.origin || '').trim();
+  const username = String(row.username || row.user || row.account || row.email || '').trim();
+  const password = String(row.password || row.pass || '').trim();
+  const name = String(row.name || row.title || row.label || '').trim();
+  if (!urlValue || !username || !password) return null;
+
+  try {
+    const parsed = new URL(urlValue.includes('://') ? urlValue : `https://${urlValue}`);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    return {
+      origin: parsed.origin,
+      username,
+      password,
+      name: name || parsed.hostname,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function importPasswords(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const normalized = list.map(normalizePasswordRow).filter(Boolean);
+  const vault = readPasswordVault();
+  let inserted = 0;
+  let updated = 0;
+
+  normalized.forEach((row) => {
+    const keyOrigin = row.origin.toLowerCase();
+    const keyUser = row.username.toLowerCase();
+    const existing = vault.entries.find(
+      (entry) => entry.origin.toLowerCase() === keyOrigin && entry.username.toLowerCase() === keyUser,
+    );
+    if (existing) {
+      existing.name = row.name;
+      existing.password = encryptPassword(row.password);
+      existing.updatedAt = Date.now();
+      updated += 1;
+      return;
+    }
+
+    vault.entries.push({
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      origin: row.origin,
+      username: row.username,
+      name: row.name,
+      password: encryptPassword(row.password),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    inserted += 1;
+  });
+
+  writePasswordVault(vault);
+  return {
+    imported: normalized.length,
+    inserted,
+    updated,
+    skipped: list.length - normalized.length,
+    encryption: safeStorage.isEncryptionAvailable() ? 'safeStorage' : 'plain',
+  };
+}
+
+function listPasswords() {
+  const vault = readPasswordVault();
+  return vault.entries
+    .map((entry) => ({
+      id: entry.id,
+      origin: entry.origin,
+      username: entry.username,
+      name: entry.name,
+      updatedAt: entry.updatedAt,
+    }))
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function getPasswordsForUrl(url) {
+  let origin = '';
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    return [];
+  }
+
+  const vault = readPasswordVault();
+  return vault.entries
+    .filter((entry) => entry.origin === origin)
+    .map((entry) => ({
+      id: entry.id,
+      origin: entry.origin,
+      username: entry.username,
+      password: decryptPassword(entry.password),
+      name: entry.name,
+    }))
+    .filter((entry) => entry.password);
+}
 
 function appendCrashLog(type, payload = {}) {
   try {
@@ -510,6 +688,7 @@ ipcMain.handle('browser:getConfig', (event) => {
       defaultZoom: Number(currentSettings().defaultZoom) || 1,
       restoreSession: Boolean(currentSettings().restoreSession),
       startupPage: currentSettings().startupPage || START_URL,
+      autofillPasswords: currentSettings().autofillPasswords !== false,
       currentProfile: currentSettings().currentProfile,
       profiles: currentSettings().profiles,
     },
@@ -609,6 +788,18 @@ ipcMain.handle('downloads:open', (_event, id) => {
   if (!record?.savePath) return false;
   shell.showItemInFolder(record.savePath);
   return true;
+});
+
+ipcMain.handle('passwords:import', (_event, rows) => {
+  return importPasswords(rows);
+});
+
+ipcMain.handle('passwords:list', () => {
+  return listPasswords();
+});
+
+ipcMain.handle('passwords:getForUrl', (_event, url) => {
+  return getPasswordsForUrl(url);
 });
 
 ipcMain.handle('window:new-private', () => {

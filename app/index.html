@@ -129,6 +129,16 @@
         <input type="checkbox" id="clearDataOnExitToggle" />
         Clear data on exit
       </label>
+      <label class="checkbox-row">
+        <input type="checkbox" id="autofillPasswordsToggle" />
+        Autofill saved passwords
+      </label>
+      <div class="password-actions">
+        <button id="importPasswordsBtn" class="btn">Import Passwords (CSV)</button>
+      </div>
+      <input id="importPasswordsInput" type="file" accept=".csv,text/csv" class="hidden" />
+      <p class="subtle-text">Import Safari/Apple Passwords CSV. Delete the CSV after import.</p>
+      <ul id="passwordsList"></ul>
     </aside>
 
     <aside id="permissionsPanel" class="panel hidden" aria-label="Permissions panel">
