@@ -18,6 +18,7 @@ const privatePartitions = new Set();
 const configuredPartitions = new Set();
 const windowsState = new Map();
 const downloads = new Map();
+const trackerBlocklistPath = path.join(__dirname, 'assets', 'tracker-blocklist.txt');
 
 const defaultState = {
   schemaVersion: STATE_SCHEMA_VERSION,
@@ -41,6 +42,8 @@ let isQuittingAfterClear = false;
 let statePath = '';
 let crashLogPath = '';
 let passwordsPath = '';
+let trackerBlocklist = loadTrackerBlocklist();
+let blocklistDomains = new Set();
 
 function getPasswordsPath() {
   if (!passwordsPath) {
@@ -331,12 +334,19 @@ function getPartitionForWindow({ privateMode, profile }) {
   return `persist:profile-${normalizedProfile}`;
 }
 
+// Intentionally duplicated from renderer to avoid IPC round-trips under context isolation.
 function getOrigin(url) {
   try {
     return new URL(url).origin;
   } catch {
     return '';
   }
+}
+
+function sanitizeStartUrl(url) {
+  const value = String(url || '').trim();
+  if (/^javascript:/i.test(value)) return START_URL;
+  return value || START_URL;
 }
 
 function getSitePermission(origin, permission) {
@@ -376,20 +386,65 @@ function isThirdPartyRequest(details) {
 }
 
 function isTrackerRequest(url) {
-  const blockedHosts = [
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (!host) return false;
+    if (trackerBlocklist.has(host)) return true;
+    if (blocklistDomains.has(host)) return true;
+    let dotIndex = host.indexOf('.');
+    while (dotIndex !== -1) {
+      const suffix = host.slice(dotIndex + 1);
+      if (trackerBlocklist.has(suffix)) return true;
+      if (blocklistDomains.has(suffix)) return true;
+      dotIndex = host.indexOf('.', dotIndex + 1);
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function loadTrackerBlocklist() {
+  const fallback = new Set([
     'doubleclick.net',
     'google-analytics.com',
     'googletagmanager.com',
-    'facebook.net',
+    'googlesyndication.com',
+    'googleadservices.com',
     'adservice.google.com',
+    'facebook.net',
+    'connect.facebook.net',
+    'graph.facebook.com',
     'taboola.com',
     'outbrain.com',
-  ];
+  ]);
+
   try {
-    const host = new URL(url).hostname.toLowerCase();
-    return blockedHosts.some((blocked) => host === blocked || host.endsWith(`.${blocked}`));
+    if (!fs.existsSync(trackerBlocklistPath)) return fallback;
+    const raw = fs.readFileSync(trackerBlocklistPath, 'utf8');
+    const entries = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim().toLowerCase())
+      .filter((line) => line && !line.startsWith('#'));
+    if (entries.length === 0) return fallback;
+    return new Set(entries);
   } catch {
-    return false;
+    return fallback;
+  }
+}
+
+function loadBlocklist() {
+  try {
+    const blocklistPath = path.join(app.getPath('userData'), 'blocklist.txt');
+    if (!fs.existsSync(blocklistPath)) return new Set();
+    const raw = fs.readFileSync(blocklistPath, 'utf8');
+    const entries = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim().toLowerCase())
+      .filter((line) => line && !line.startsWith('#'));
+    return new Set(entries);
+  } catch {
+    return new Set();
   }
 }
 
@@ -428,9 +483,13 @@ async function fetchSuggestions(query) {
 
   for (const endpoint of endpoints) {
     try {
-      const response = await fetch(endpoint, {
-        headers: { Accept: 'application/json, text/plain, */*' },
-      });
+      const response = await Promise.race([
+        fetch(endpoint, {
+          headers: { Accept: 'application/json, text/plain, */*' },
+        }),
+        new Promise((resolve) => setTimeout(() => resolve(null), 3000)),
+      ]);
+      if (!response) continue;
       if (!response.ok) continue;
 
       const contentType = response.headers.get('content-type') || '';
@@ -601,6 +660,10 @@ function configureSessionPartition(partition) {
       current.totalBytes = item.getTotalBytes();
       current.savePath = item.getSavePath() || current.savePath;
       publishDownloads();
+      setTimeout(() => {
+        downloads.delete(id);
+        publishDownloads();
+      }, 10 * 60 * 1000);
     });
   });
 }
@@ -645,7 +708,12 @@ function createWindow(options = {}) {
   });
 
   win.on('closed', () => {
+    const state = windowsState.get(windowKey);
     windowsState.delete(windowKey);
+    if (state?.privateMode && state.partition) {
+      privatePartitions.delete(state.partition);
+      configuredPartitions.delete(state.partition);
+    }
   });
 
   win.loadFile(path.join(__dirname, 'index.html'));
@@ -679,15 +747,16 @@ app.on('certificate-error', (event, webContents, url, error) => {
 
 ipcMain.handle('browser:getConfig', (event) => {
   const winState = getWindowStateBySender(event.sender);
+  const startupPage = sanitizeStartUrl(currentSettings().startupPage || START_URL);
   return {
-    startUrl: currentSettings().startupPage || START_URL,
+    startUrl: startupPage,
     partition: winState?.partition || getPartitionForWindow({ privateMode: false, profile: currentSettings().currentProfile }),
     privateMode: Boolean(winState?.privateMode),
     profile: winState?.profile || currentSettings().currentProfile,
     settings: {
       defaultZoom: Number(currentSettings().defaultZoom) || 1,
       restoreSession: Boolean(currentSettings().restoreSession),
-      startupPage: currentSettings().startupPage || START_URL,
+      startupPage,
       autofillPasswords: currentSettings().autofillPasswords !== false,
       currentProfile: currentSettings().currentProfile,
       profiles: currentSettings().profiles,
@@ -703,6 +772,8 @@ ipcMain.handle('browser:newPrivatePartition', () => {
 });
 
 ipcMain.handle('settings:get', () => currentSettings());
+
+ipcMain.handle('blocklist:getCount', () => blocklistDomains.size);
 
 ipcMain.handle('settings:update', (_event, updates) => {
   const next = { ...currentSettings(), ...updates };
@@ -822,15 +893,17 @@ app.on('before-quit', (event) => {
   Promise.all(
     [...configuredPartitions]
       .filter((partition) => !privatePartitions.has(partition))
-      .map((partition) => session.fromPartition(partition).clearStorageData().catch(() => {})),
+      .map((partition) => session.fromPartition(partition).clearStorageData().catch(() => { })),
   ).finally(() => {
     app.quit();
   });
 });
 
 app.whenReady().then(() => {
+  app.commandLine.appendSwitch('enable-features', 'IsolateOrigins,site-per-process');
   installCrashLogging();
   loadState();
+  blocklistDomains = loadBlocklist();
   configureSessionPartition(getPartitionForWindow({ privateMode: false, profile: currentSettings().currentProfile }));
   createWindow({ privateMode: false, profile: currentSettings().currentProfile });
 

@@ -97,8 +97,8 @@ let browserConfig = {
 let tabs = [];
 let activeTabId = null;
 let nextTabId = 1;
-let bookmarks = loadBookmarks();
-let historyEntries = loadHistoryEntries();
+let bookmarks = null;
+let historyEntries = null;
 let zoomByOrigin = loadJson(STORAGE_KEYS.zoomByOrigin, {});
 let downloads = [];
 let closedTabs = [];
@@ -106,6 +106,7 @@ let savedPasswords = [];
 let suggestionItems = [];
 let selectedSuggestionIndex = -1;
 let suggestionRequestId = 0;
+let suggestionDebounceTimer = null;
 let removeDownloadsListener = null;
 let removeContextListener = null;
 let removeCertListener = null;
@@ -114,6 +115,9 @@ let panelsRendered = {
   bookmarks: false,
   history: false,
 };
+let sessionSaveTimer = null;
+let settingsPanelRequestId = 0;
+let settingsDirty = false;
 
 function storageKey(name) {
   const profile = browserConfig.profile || 'default';
@@ -148,6 +152,16 @@ function loadHistoryEntries() {
 
 function saveHistoryEntries() {
   saveJson(STORAGE_KEYS.historyEntries, historyEntries);
+}
+
+function getBookmarks() {
+  if (!Array.isArray(bookmarks)) bookmarks = loadBookmarks();
+  return bookmarks;
+}
+
+function getHistoryEntries() {
+  if (!Array.isArray(historyEntries)) historyEntries = loadHistoryEntries();
+  return historyEntries;
 }
 
 function saveZoomByOrigin() {
@@ -207,6 +221,10 @@ function toSearchUrl(input) {
 function normalizeInputToUrl(rawValue) {
   const value = String(rawValue || '').trim();
   if (!value) return browserConfig.startUrl;
+  if (value.toLowerCase() === 'about:blank') return 'about:blank';
+  if (value.toLowerCase() === 'about:newtab') return browserConfig.startUrl;
+  if (/^javascript:/i.test(value)) return browserConfig.startUrl;
+  if (/^http:\/\//i.test(value)) return value.replace(/^http:\/\//i, 'https://');
 
   if (/^https?:\/\//i.test(value)) return value;
   if (value.includes('.') && !value.includes(' ')) return `https://${value}`;
@@ -233,8 +251,8 @@ function mergeSuggestions(items, limit = 8) {
 function getLocalSuggestions(query) {
   const needle = query.toLowerCase();
   const pool = [
-    ...bookmarks.flatMap((bookmark) => [bookmark.title, bookmark.url]),
-    ...historyEntries.flatMap((entry) => [entry.title, entry.url]),
+    ...getBookmarks().flatMap((bookmark) => [bookmark.title, bookmark.url]),
+    ...getHistoryEntries().flatMap((entry) => [entry.title, entry.url]),
   ];
 
   return mergeSuggestions(pool.filter((value) => String(value || '').toLowerCase().includes(needle)), 8);
@@ -292,6 +310,11 @@ async function updateSuggestions(query) {
   } catch {
     // Keep local suggestions.
   }
+}
+
+function debouncedUpdateSuggestions(query) {
+  clearTimeout(suggestionDebounceTimer);
+  suggestionDebounceTimer = setTimeout(() => updateSuggestions(query), 180);
 }
 
 function getActiveTab() {
@@ -381,6 +404,15 @@ function renderTabs() {
     button.className = `tab ${tab.id === activeTabId ? 'active' : ''}`;
     button.title = tab.title || tab.url;
 
+    if (tab.favicon) {
+      const icon = document.createElement('img');
+      icon.src = tab.favicon;
+      icon.width = 14;
+      icon.height = 14;
+      icon.style = 'margin-right:4px; border-radius:2px;';
+      button.appendChild(icon);
+    }
+
     const label = document.createElement('span');
     label.className = 'tab-label';
     label.textContent = `${tab.isPrivate ? '[Private] ' : ''}${tab.title || 'New Tab'}`;
@@ -401,6 +433,12 @@ function renderTabs() {
 }
 
 function saveSession() {
+  if (browserConfig.privateMode) return;
+  clearTimeout(sessionSaveTimer);
+  sessionSaveTimer = setTimeout(_doSaveSession, 500);
+}
+
+function _doSaveSession() {
   if (browserConfig.privateMode) return;
 
   const payload = {
@@ -431,13 +469,16 @@ function recordHistory(tab, url, title) {
 
   const normalizedUrl = String(url || '').trim();
   if (!/^https?:\/\//i.test(normalizedUrl)) return;
+  if (tab._lastRecordedUrl === normalizedUrl) return;
 
+  historyEntries = getHistoryEntries();
   historyEntries = historyEntries.filter((entry) => entry.url !== normalizedUrl);
   historyEntries.unshift({
     url: normalizedUrl,
     title: String(title || normalizedUrl).slice(0, 200),
     visitedAt: Date.now(),
   });
+  tab._lastRecordedUrl = normalizedUrl;
 
   historyEntries = historyEntries.slice(0, 500);
   saveHistoryEntries();
@@ -451,9 +492,13 @@ function wireWebviewEvents(tab) {
   const { webview } = tab;
 
   webview.addEventListener('did-stop-loading', () => {
-    tab.url = webview.getURL() || tab.url;
+    const latestUrl = webview.getURL() || tab.url;
+    tab.url = latestUrl;
     tab.title = webview.getTitle() || tab.title;
-    applyStoredZoomForTab(tab);
+    if (webview.getURL() !== tab._lastZoomedUrl) {
+      applyStoredZoomForTab(tab);
+      tab._lastZoomedUrl = webview.getURL();
+    }
     recordHistory(tab, tab.url, tab.title);
     saveSession();
     renderTabs();
@@ -462,6 +507,7 @@ function wireWebviewEvents(tab) {
       if (isPanelOpen(permissionsPanel)) refreshPermissionsForActiveTab();
       hideLoadingOverlay();
     }
+    tryAutofillPasswords(tab);
   });
 
   webview.addEventListener('did-navigate', () => {
@@ -489,6 +535,13 @@ function wireWebviewEvents(tab) {
   webview.addEventListener('page-title-updated', (event) => {
     tab.title = event.title || tab.title;
     renderTabs();
+  });
+
+  webview.addEventListener('page-favicon-updated', (event) => {
+    if (event.favicons && event.favicons[0]) {
+      tab.favicon = event.favicons[0];
+      renderTabs();
+    }
   });
 
   webview.addEventListener('did-run-insecure-content', () => {
@@ -521,6 +574,7 @@ function createTab(initialUrl = browserConfig.startUrl, options = {}) {
     title: 'New Tab',
     url: normalizeInputToUrl(initialUrl),
     isPrivate,
+    favicon: null,
     webview: document.createElement('webview'),
   };
 
@@ -572,7 +626,13 @@ function closeTab(tabId, options = {}) {
     });
     closedTabs = closedTabs.slice(0, 50);
   }
-  removed.webview.remove();
+  if (removed.webview) {
+    if (typeof removed.webview.closeDevTools === 'function') {
+      removed.webview.closeDevTools();
+    }
+    removed.webview.src = 'about:blank';
+    removed.webview.remove();
+  }
 
   if (tabs.length === 0) {
     createTab(browserConfig.startUrl);
@@ -609,8 +669,6 @@ function focusAddressBar() {
 function stabilizeAddressBarFocusForNewTab(tab) {
   if (!tab) return;
 
-  let ticks = 0;
-  const maxTicks = 15;
   const enforceFocus = () => {
     if (activeTabId !== tab.id) return;
     if (document.activeElement !== urlInput) {
@@ -618,13 +676,17 @@ function stabilizeAddressBarFocusForNewTab(tab) {
     }
   };
 
-  const timer = setInterval(() => {
-    ticks += 1;
+  const observer = new MutationObserver(() => {
+    if (!webviewContainer.contains(tab.webview)) return;
     enforceFocus();
-    if (ticks >= maxTicks || document.activeElement === urlInput) {
-      clearInterval(timer);
-    }
-  }, 80);
+    observer.disconnect();
+  });
+
+  observer.observe(webviewContainer, { childList: true });
+  if (webviewContainer.contains(tab.webview)) {
+    enforceFocus();
+    observer.disconnect();
+  }
 
   tab.webview.addEventListener('did-start-loading', enforceFocus, { once: true });
   tab.webview.addEventListener('dom-ready', enforceFocus, { once: true });
@@ -663,6 +725,7 @@ function resetActiveZoom() {
 }
 
 function renderBookmarks() {
+  bookmarks = getBookmarks();
   bookmarksList.innerHTML = '';
 
   if (bookmarks.length === 0) {
@@ -700,6 +763,7 @@ function renderBookmarks() {
 }
 
 function renderHistory() {
+  historyEntries = getHistoryEntries();
   historyList.innerHTML = '';
   const filtered = getFilteredHistoryEntries();
   if (filtered.length === 0) {
@@ -733,7 +797,7 @@ function renderHistory() {
 
 function getFilteredHistoryEntries() {
   const query = String(historySearchInput.value || '').trim().toLowerCase();
-  return historyEntries.filter((entry) => {
+  return getHistoryEntries().filter((entry) => {
     if (!query) return true;
     return String(entry.title || '').toLowerCase().includes(query) || String(entry.url || '').toLowerCase().includes(query);
   });
@@ -765,6 +829,16 @@ function renderDownloads() {
     const percent = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
     status.textContent = `${entry.state}${total > 0 ? ` (${percent}%)` : ''}${entry.privateMode ? ' [private]' : ''}`;
 
+    let bar = null;
+    if (entry.state === 'progressing' && total > 0) {
+      bar = document.createElement('div');
+      bar.className = 'download-progress-bar';
+      const fill = document.createElement('div');
+      fill.className = 'download-progress-fill';
+      fill.style.width = `${percent}%`;
+      bar.appendChild(fill);
+    }
+
     const actions = document.createElement('div');
     actions.className = 'download-actions';
     if (entry.state === 'completed' && entry.savePath) {
@@ -777,7 +851,11 @@ function renderDownloads() {
       actions.appendChild(openBtn);
     }
 
-    item.append(name, status, actions);
+    if (bar) {
+      item.append(name, status, bar, actions);
+    } else {
+      item.append(name, status, actions);
+    }
     downloadsList.appendChild(item);
   });
 }
@@ -892,16 +970,19 @@ async function importPasswordsFromFile(file) {
 }
 
 async function tryAutofillPasswords(tab) {
-  if (!tab || tab.isPrivate || browserConfig.settings.autofillPasswords === false) return;
-
-  const url = tab.webview.getURL() || tab.url;
-  if (!/^https?:\/\//i.test(url)) return;
-
-  const credentials = await window.api.getPasswordsForUrl(url);
-  if (!Array.isArray(credentials) || credentials.length === 0) return;
-
-  const first = credentials[0];
   try {
+    if (!tab || tab.isPrivate || browserConfig.settings.autofillPasswords === false) return;
+
+    const url = tab.webview.getURL() || tab.url;
+    if (!url) return;
+    if (url === 'about:blank' || url === 'about:newtab') return;
+    if (url === browserConfig.startUrl) return;
+    if (!/^https?:\/\//i.test(url)) return;
+
+    const credentials = await window.api.getPasswordsForUrl(url);
+    if (!Array.isArray(credentials) || credentials.length === 0) return;
+
+    const first = credentials[0];
     await tab.webview.executeJavaScript(
       `
       (() => {
@@ -910,26 +991,26 @@ async function tryAutofillPasswords(tab) {
         const passInput = document.querySelector('input[type="password"]:not([disabled])');
         if (!passInput) return false;
 
-        const form = passInput.form || document;
-        const userInput =
-          form.querySelector('input[type="email"]:not([disabled])') ||
-          form.querySelector('input[type="text"]:not([disabled])') ||
-          form.querySelector('input[name*="user" i]:not([disabled])') ||
-          form.querySelector('input[name*="email" i]:not([disabled])');
+        const root = passInput.form || document;
+        const candidates = Array.from(
+          root.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"]'),
+        ).filter((input) => !input.disabled);
+        let userInput = null;
+        for (const candidate of candidates) {
+          if (candidate === passInput) continue;
+          if (candidate.compareDocumentPosition(passInput) & Node.DOCUMENT_POSITION_FOLLOWING) {
+            userInput = candidate;
+          }
+        }
 
-        if (userInput && !userInput.value) {
+        if (userInput) {
           userInput.value = username;
           userInput.dispatchEvent(new Event('input', { bubbles: true }));
-          userInput.dispatchEvent(new Event('change', { bubbles: true }));
         }
 
-        if (!passInput.value) {
-          passInput.value = password;
-          passInput.dispatchEvent(new Event('input', { bubbles: true }));
-          passInput.dispatchEvent(new Event('change', { bubbles: true }));
-          return true;
-        }
-        return false;
+        passInput.value = password;
+        passInput.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
       })();
     `,
       true,
@@ -945,6 +1026,8 @@ function addBookmark() {
 
   const url = tab.webview.getURL() || tab.url;
   if (!url) return;
+  if (url.toLowerCase().startsWith('javascript:')) return;
+  bookmarks = getBookmarks();
   if (bookmarks.some((bookmark) => bookmark.url === url)) return;
 
   bookmarks.unshift({
@@ -984,20 +1067,29 @@ function closeFindPanel() {
   if (tab) tab.webview.stopFindInPage('clearSelection');
 }
 
-async function initSettingsUI() {
-  const latestSettings = await window.api.getSettings();
+async function initSettingsUI(cachedSettings) {
+  const [latestSettings, privacy] = await Promise.all([
+    cachedSettings ? Promise.resolve(cachedSettings) : window.api.getSettings(),
+    window.api.getPrivacySettings(),
+  ]);
   browserConfig.settings = {
     ...browserConfig.settings,
     ...latestSettings,
   };
   browserConfig.startUrl = browserConfig.settings.startupPage || browserConfig.startUrl;
 
-  startupPageInput.value = browserConfig.settings.startupPage || browserConfig.startUrl;
-  defaultZoomInput.value = String(browserConfig.settings.defaultZoom || 1);
-  restoreSessionToggle.checked = Boolean(browserConfig.settings.restoreSession);
+  await applySettingsToUI(browserConfig.settings, privacy);
+}
+
+async function applySettingsToUI(settings, privacy) {
+  const next = settings || browserConfig.settings;
+  startupPageInput.value = next.startupPage || browserConfig.startUrl;
+  defaultZoomInput.value = String(next.defaultZoom || 1);
+  restoreSessionToggle.checked = Boolean(next.restoreSession);
+  autofillPasswordsToggle.checked = next.autofillPasswords !== false;
 
   profileSelect.innerHTML = '';
-  (browserConfig.settings.profiles || ['personal', 'work']).forEach((profile) => {
+  (next.profiles || ['personal', 'work']).forEach((profile) => {
     const option = document.createElement('option');
     option.value = profile;
     option.textContent = profile;
@@ -1006,15 +1098,60 @@ async function initSettingsUI() {
   profileSelect.value = browserConfig.profile;
   profileChipBtn.textContent = browserConfig.profile || 'profile';
 
-  const privacy = await window.api.getPrivacySettings();
-  blockPopupsToggle.checked = Boolean(privacy.blockPopups);
-  blockThirdPartyCookiesToggle.checked = Boolean(privacy.blockThirdPartyCookies);
-  blockTrackersToggle.checked = Boolean(privacy.blockTrackers);
-  clearDataOnExitToggle.checked = Boolean(privacy.clearDataOnExit);
+  if (privacy) {
+    blockPopupsToggle.checked = Boolean(privacy.blockPopups);
+    blockThirdPartyCookiesToggle.checked = Boolean(privacy.blockThirdPartyCookies);
+    blockTrackersToggle.checked = Boolean(privacy.blockTrackers);
+    clearDataOnExitToggle.checked = Boolean(privacy.clearDataOnExit);
+  }
+
+  const existingBlocklist = document.getElementById('blocklist-count-label');
+  if (existingBlocklist) existingBlocklist.remove();
+  try {
+    const count = await window.api.getBlocklistCount();
+    if (count > 0) {
+      const label = document.createElement('p');
+      label.id = 'blocklist-count-label';
+      label.className = 'subtle-text';
+      label.textContent = `Blocklist: ${count.toLocaleString()} domains loaded`;
+      settingsPanel.appendChild(label);
+    }
+  } catch {
+    // Ignore blocklist count errors.
+  }
 
   const mode = getThemeMode();
   themeSelect.value = mode;
   applyTheme(mode);
+}
+
+async function openSettingsPanel() {
+  const shouldOpen = settingsPanel.classList.contains('hidden');
+  closeAllPanels();
+  if (!shouldOpen) return;
+  settingsPanel.classList.remove('hidden');
+  refreshSavedPasswords();
+
+  const requestId = ++settingsPanelRequestId;
+  try {
+    const [latestSettings, privacy] = await Promise.all([
+      window.api.getSettings(),
+      window.api.getPrivacySettings(),
+    ]);
+    if (requestId !== settingsPanelRequestId || settingsPanel.classList.contains('hidden')) return;
+    browserConfig.settings = {
+      ...browserConfig.settings,
+      ...latestSettings,
+    };
+    browserConfig.startUrl = browserConfig.settings.startupPage || browserConfig.startUrl;
+    await applySettingsToUI(browserConfig.settings, privacy);
+  } catch {
+    // Keep existing UI values if refresh fails.
+  }
+}
+
+function markSettingsDirty() {
+  settingsDirty = true;
 }
 
 async function saveSettings() {
@@ -1022,6 +1159,7 @@ async function saveSettings() {
     startupPage: String(startupPageInput.value || browserConfig.startUrl).trim(),
     defaultZoom: Number(defaultZoomInput.value || 1),
     restoreSession: Boolean(restoreSessionToggle.checked),
+    autofillPasswords: Boolean(autofillPasswordsToggle.checked),
     currentProfile: profileSelect.value,
   };
 
@@ -1032,6 +1170,7 @@ async function saveSettings() {
     ...next,
   };
   browserConfig.startUrl = browserConfig.settings.startupPage || browserConfig.startUrl;
+  settingsDirty = false;
 
   if (beforeProfile !== browserConfig.settings.currentProfile) {
     await window.api.relaunchApp();
@@ -1052,8 +1191,8 @@ function buildBackupPayload() {
     exportedAt: new Date().toISOString(),
     profile: browserConfig.profile,
     themeMode: getThemeMode(),
-    bookmarks,
-    historyEntries,
+    bookmarks: getBookmarks(),
+    historyEntries: getHistoryEntries(),
     tabsSession: loadSession(),
     zoomByOrigin,
     settings: {
@@ -1079,7 +1218,7 @@ function exportBackup() {
   document.body.appendChild(anchor);
   anchor.click();
   anchor.remove();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
 async function importBackupFromFile(file) {
@@ -1092,12 +1231,14 @@ async function importBackupFromFile(file) {
     bookmarks = data.bookmarks;
     saveBookmarks();
     renderBookmarks();
+    panelsRendered.bookmarks = false;
   }
 
   if (Array.isArray(data.historyEntries)) {
     historyEntries = data.historyEntries;
     saveHistoryEntries();
     renderHistory();
+    panelsRendered.history = false;
   }
 
   if (data.zoomByOrigin && typeof data.zoomByOrigin === 'object') {
@@ -1119,6 +1260,10 @@ async function importBackupFromFile(file) {
       startupPage: String(data.settings.startupPage || browserConfig.settings.startupPage || browserConfig.startUrl),
       defaultZoom: Number(data.settings.defaultZoom || browserConfig.settings.defaultZoom || 1),
       restoreSession: Boolean(data.settings.restoreSession),
+      autofillPasswords:
+        typeof data.settings.autofillPasswords === 'boolean'
+          ? data.settings.autofillPasswords
+          : browserConfig.settings.autofillPasswords,
     };
     await window.api.updateSettings(updates);
 
@@ -1220,7 +1365,9 @@ function bindEvents() {
   });
 
   homeBtn.addEventListener('click', () => navigateActiveTab(browserConfig.startUrl));
-  profileChipBtn.addEventListener('click', () => togglePanel(settingsPanel));
+  profileChipBtn.addEventListener('click', () => {
+    openSettingsPanel();
+  });
 
   findBtn.addEventListener('click', openFindPanel);
   historyBtn.addEventListener('click', () => togglePanel(historyPanel));
@@ -1258,8 +1405,9 @@ function bindEvents() {
     }
   });
 
-  urlInput.addEventListener('input', () => updateSuggestions(urlInput.value));
-  urlInput.addEventListener('focus', () => updateSuggestions(urlInput.value));
+  urlInput.addEventListener('input', () => debouncedUpdateSuggestions(urlInput.value));
+  urlInput.addEventListener('focus', () => debouncedUpdateSuggestions(urlInput.value));
+  urlInput.addEventListener('click', () => urlInput.select());
   urlInput.addEventListener('blur', () => setTimeout(hideSuggestions, 120));
 
   findInput.addEventListener('input', () => doFind(true));
@@ -1283,12 +1431,32 @@ function bindEvents() {
   });
 
   clearHistoryBtn.addEventListener('click', () => {
+    if (!confirm('Clear all history? This cannot be undone.')) return;
     historyEntries = [];
     saveHistoryEntries();
     renderHistory();
   });
 
-  settingsBtn.addEventListener('click', () => togglePanel(settingsPanel));
+  settingsBtn.addEventListener('click', () => {
+    openSettingsPanel();
+  });
+  importPasswordsBtn.addEventListener('click', () => importPasswordsInput.click());
+  importPasswordsInput.addEventListener('change', async () => {
+    try {
+      const file = importPasswordsInput.files?.[0];
+      const result = await importPasswordsFromFile(file);
+      await refreshSavedPasswords();
+      notify(
+        `Imported ${result.inserted} passwords (${result.updated} updated, ${result.skipped} skipped)`,
+        'success',
+      );
+    } catch (error) {
+      console.error('Password import failed', error);
+      notify('Failed to import passwords', 'error');
+    } finally {
+      importPasswordsInput.value = '';
+    }
+  });
   saveSettingsBtn.addEventListener('click', async () => {
     try {
       await saveSettings();
@@ -1320,6 +1488,24 @@ function bindEvents() {
     } finally {
       importBackupInput.value = '';
     }
+  });
+
+  [
+    startupPageInput,
+    defaultZoomInput,
+    restoreSessionToggle,
+    autofillPasswordsToggle,
+    profileSelect,
+    newProfileInput,
+    themeSelect,
+    blockPopupsToggle,
+    blockThirdPartyCookiesToggle,
+    blockTrackersToggle,
+    clearDataOnExitToggle,
+  ].forEach((element) => {
+    if (!element) return;
+    element.addEventListener('input', markSettingsDirty);
+    element.addEventListener('change', markSettingsDirty);
   });
 
   addProfileBtn.addEventListener('click', async () => {
@@ -1428,9 +1614,16 @@ function bindEvents() {
       return;
     }
 
+    if (key === 'd') {
+      event.preventDefault();
+      addBookmark();
+      notify('Bookmark added', 'success');
+      return;
+    }
+
     if (key === ',') {
       event.preventDefault();
-      togglePanel(settingsPanel);
+      openSettingsPanel();
       return;
     }
 
@@ -1487,6 +1680,11 @@ function bindEvents() {
     );
 
     if (!clickedInsidePanel && !clickedPanelToggle) {
+      if (settingsDirty && !settingsPanel.classList.contains('hidden')) {
+        const confirmed = confirm('You have unsaved settings. Close anyway?');
+        if (!confirmed) return;
+        settingsDirty = false;
+      }
       closeAllPanels();
     }
   });
@@ -1530,14 +1728,12 @@ function restoreSessionOrDefault() {
 
 async function init() {
   browserConfig = await window.api.getBrowserConfig();
-  bookmarks = loadBookmarks();
-  historyEntries = loadHistoryEntries();
   zoomByOrigin = loadJson(STORAGE_KEYS.zoomByOrigin, {});
 
   bindEvents();
   registerMainEventHooks();
   restoreSessionOrDefault();
-  await initSettingsUI();
+  await initSettingsUI(browserConfig.settings);
   profileChipBtn.textContent = browserConfig.profile || 'profile';
 
   if (browserConfig.privateMode) {
@@ -1549,6 +1745,7 @@ window.addEventListener('beforeunload', () => {
   if (typeof removeDownloadsListener === 'function') removeDownloadsListener();
   if (typeof removeContextListener === 'function') removeContextListener();
   if (typeof removeCertListener === 'function') removeCertListener();
+  _doSaveSession();
 });
 
 init();

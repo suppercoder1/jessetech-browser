@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('api', {
 
   getPrivacySettings: () => ipcRenderer.invoke('privacy:get'),
   updatePrivacySettings: (updates) => ipcRenderer.invoke('privacy:update', updates),
+  getBlocklistCount: () => ipcRenderer.invoke('blocklist:getCount'),
 
   getPermissions: (origin) => ipcRenderer.invoke('permissions:get', origin),
   setPermission: (origin, permission, value) => ipcRenderer.invoke('permissions:set', origin, permission, value),

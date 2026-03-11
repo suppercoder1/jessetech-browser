@@ -11,13 +11,17 @@
     "dist:mac": "electron-builder --mac"
   },
   "devDependencies": {
-    "electron": "^29.4.6",
-    "electron-builder": "^24.13.3"
+    "electron": "^41.0.0",
+    "electron-builder": "^26.8.1"
   },
   "build": {
     "appId": "nl.jessetech.browser",
     "productName": "JesseTech Browser",
     "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "files": [
+      "app/**/*",
+      "package.json"
+    ],
     "mac": {
       "category": "public.app-category.utilities",
       "icon": "app/assets/icon.png",
@@ -25,6 +29,18 @@
         "dmg",
         "zip"
       ]
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "app/assets/icon.png"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "app/assets/icon.png"
     }
   }
 }
